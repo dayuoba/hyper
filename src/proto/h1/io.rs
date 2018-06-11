@@ -595,7 +595,7 @@ mod tests {
             cached_headers: &mut None,
             req_method: &mut None,
         };
-        assert!(buffered.parse::<::proto::ClientTransaction>(ctx).unwrap().is_not_ready());
+        assert!(buffered.parse::<::proto::h1::ClientTransaction>(ctx).unwrap().is_not_ready());
         assert!(buffered.io.blocked());
     }
 

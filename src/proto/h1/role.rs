@@ -15,18 +15,12 @@ const MAX_HEADERS: usize = 100;
 const AVERAGE_HEADER_SIZE: usize = 30; // totally scientific
 
 // There are 2 main roles, Client and Server.
-//
-// There is 1 modifier, OnUpgrade, which can wrap Client and Server,
-// to signal that HTTP upgrades are not supported.
 
-pub(crate) struct Client<T>(T);
+pub(crate) enum Client {}
 
-pub(crate) struct Server<T>(T);
+pub(crate) enum Server {}
 
-impl<T> Http1Transaction for Server<T>
-where
-    T: OnUpgrade,
-{
+impl Http1Transaction for Server {
     type Incoming = RequestLine;
     type Outgoing = StatusCode;
 
@@ -82,6 +76,7 @@ where
         let mut con_len = None;
         let mut is_te = false;
         let mut is_te_chunked = false;
+        let mut wants_auto_upgrade = false;
 
         let mut headers = ctx.cached_headers
             .take()
@@ -152,6 +147,9 @@ where
                 header::EXPECT => {
                     expect_continue = value.as_bytes() == b"100-continue";
                 },
+                header::UPGRADE => {
+                    wants_auto_upgrade = true;
+                },
 
                 _ => (),
             }
@@ -180,6 +178,7 @@ where
             decode: Decode::Normal(decoder),
             expect_continue,
             keep_alive,
+            wants_auto_upgrade,
         }))
     }
 
@@ -194,7 +193,7 @@ where
         let is_upgrade = msg.head.subject == StatusCode::SWITCHING_PROTOCOLS
             || (msg.req_method == &Some(Method::CONNECT) && msg.head.subject.is_success());
         let (ret, mut is_last) = if is_upgrade {
-            (T::on_encode_upgrade(&mut msg), true)
+            (Ok(()), true)
         } else if msg.head.subject.is_informational() {
             error!("response with 1xx status code not supported");
             *msg.head = MessageHead::default();
@@ -485,7 +484,7 @@ where
     }
 }
 
-impl Server<()> {
+impl Server {
     fn can_have_body(method: &Option<Method>, status: StatusCode) -> bool {
         Server::can_chunked(method, status)
     }
@@ -508,10 +507,7 @@ impl Server<()> {
     }
 }
 
-impl<T> Http1Transaction for Client<T>
-where
-    T: OnUpgrade,
-{
+impl Http1Transaction for Client {
     type Incoming = StatusCode;
     type Outgoing = RequestLine;
 
@@ -559,13 +555,14 @@ where
             subject: status,
             headers,
         };
-        let decode = Client::<T>::decoder(&head, ctx.req_method)?;
+        let decode = Client::decoder(&head, ctx.req_method)?;
 
         Ok(Some(ParsedMessage {
             head,
             decode,
             expect_continue: false,
             keep_alive,
+            wants_auto_upgrade: false,
         }))
     }
 
@@ -617,7 +614,7 @@ where
     }
 }
 
-impl<T: OnUpgrade> Client<T> {
+impl Client {
     fn decoder(inc: &MessageHead<StatusCode>, method: &mut Option<Method>) -> Result<Decode, Parse> {
         // According to https://tools.ietf.org/html/rfc7230#section-3.3.3
         // 1. HEAD responses, and Status 1xx, 204, and 304 cannot have a body.
@@ -630,7 +627,7 @@ impl<T: OnUpgrade> Client<T> {
 
         match inc.subject.as_u16() {
             101 => {
-                return T::on_decode_upgrade().map(Decode::Final);
+                return Ok(Decode::Upgrade(Decoder::length(0)));
             },
             100...199 => {
                 trace!("ignoring informational response: {}", inc.subject.as_u16());
@@ -646,7 +643,7 @@ impl<T: OnUpgrade> Client<T> {
             }
             Some(Method::CONNECT) => match inc.subject.as_u16() {
                 200...299 => {
-                    return Ok(Decode::Final(Decoder::length(0)));
+                    return Ok(Decode::Upgrade(Decoder::length(0)));
                 },
                 _ => {},
             },
@@ -682,7 +679,7 @@ impl<T: OnUpgrade> Client<T> {
     }
 }
 
-impl Client<()> {
+impl Client {
     fn set_length(head: &mut RequestHead, body: Option<BodyLength>) -> Encoder {
         if let Some(body) = body {
             let can_chunked = head.version == Version::HTTP_11
@@ -830,51 +827,6 @@ fn set_content_length(headers: &mut HeaderMap, len: u64) -> Encoder {
     }
 }
 
-pub(crate) trait OnUpgrade {
-    fn on_encode_upgrade(msg: &mut Encode<StatusCode>) -> ::Result<()>;
-    fn on_decode_upgrade() -> Result<Decoder, Parse>;
-}
-
-pub(crate) enum YesUpgrades {}
-
-pub(crate) enum NoUpgrades {}
-
-impl OnUpgrade for YesUpgrades {
-    fn on_encode_upgrade(_: &mut Encode<StatusCode>) -> ::Result<()> {
-        Ok(())
-    }
-
-    fn on_decode_upgrade() -> Result<Decoder, Parse> {
-        debug!("101 response received, upgrading");
-        // 101 upgrades always have no body
-        Ok(Decoder::length(0))
-    }
-}
-
-impl OnUpgrade for NoUpgrades {
-    fn on_encode_upgrade(msg: &mut Encode<StatusCode>) -> ::Result<()> {
-        *msg.head = MessageHead::default();
-        msg.head.subject = ::StatusCode::INTERNAL_SERVER_ERROR;
-        msg.body = None;
-
-        if msg.head.subject == StatusCode::SWITCHING_PROTOCOLS {
-            error!("response with 101 status code not supported");
-            Err(Parse::UpgradeNotSupported.into())
-        } else if msg.req_method == &Some(Method::CONNECT) {
-            error!("200 response to CONNECT request not supported");
-            Err(::Error::new_user_unsupported_request_method())
-        } else {
-            debug_assert!(false, "upgrade incorrectly detected");
-            Err(::Error::new_status())
-        }
-    }
-
-    fn on_decode_upgrade() -> Result<Decoder, Parse> {
-        debug!("received 101 upgrade response, not supported");
-        Err(Parse::UpgradeNotSupported)
-    }
-}
-
 #[derive(Clone, Copy)]
 struct HeaderIndices {
     name: (usize, usize),
@@ -978,10 +930,6 @@ mod tests {
     use bytes::BytesMut;
 
     use super::*;
-    use super::{Server as S, Client as C};
-
-    type Server = S<NoUpgrades>;
-    type Client = C<NoUpgrades>;
 
     #[test]
     fn test_parse_request() {
@@ -1257,7 +1205,7 @@ mod tests {
         assert_eq!(parse_with_method("\
             HTTP/1.1 200 OK\r\n\
             \r\n\
-        ", Method::CONNECT).decode, Decode::Final(Decoder::length(0)));
+        ", Method::CONNECT).decode, Decode::Upgrade(Decoder::length(0)));
 
         // CONNECT receiving non 200 can have a body
         assert_eq!(parse_with_method("\
@@ -1278,10 +1226,10 @@ mod tests {
         ").decode, Decode::Ignore);
 
         // 101 upgrade not supported yet
-        parse_err("\
+        assert_eq!(parse("\
             HTTP/1.1 101 Switching Protocols\r\n\
             \r\n\
-        ");
+        ").decode, Decode::Upgrade(Decoder::length(0)));
 
 
         // http/1.0
@@ -1320,28 +1268,11 @@ mod tests {
     }
 
     #[test]
-    fn test_server_no_upgrades_connect_method() {
+    fn test_server_encode_connect_method() {
         let mut head = MessageHead::default();
 
         let mut vec = Vec::new();
-        let err = Server::encode(Encode {
-            head: &mut head,
-            body: None,
-            keep_alive: true,
-            req_method: &mut Some(Method::CONNECT),
-            title_case_headers: false,
-        }, &mut vec).unwrap_err();
-
-        assert!(err.is_user());
-        assert_eq!(err.kind(), &::error::Kind::UnsupportedRequestMethod);
-    }
-
-    #[test]
-    fn test_server_yes_upgrades_connect_method() {
-        let mut head = MessageHead::default();
-
-        let mut vec = Vec::new();
-        let encoder = S::<YesUpgrades>::encode(Encode {
+        let encoder = Server::encode(Encode {
             head: &mut head,
             body: None,
             keep_alive: true,

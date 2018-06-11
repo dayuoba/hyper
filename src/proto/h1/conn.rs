@@ -44,6 +44,7 @@ where I: AsyncRead + AsyncWrite,
                 notify_read: false,
                 reading: Reading::Init,
                 writing: Writing::Init,
+                upgrade: None,
                 // We assume a modern world where the remote speaks HTTP/1.1.
                 // If they tell us otherwise, we'll downgrade in `read_head`.
                 version: Version::HTTP_11,
@@ -70,6 +71,10 @@ where I: AsyncRead + AsyncWrite,
 
     pub fn into_inner(self) -> (I, Bytes) {
         self.io.into_inner()
+    }
+
+    pub fn pending_upgrade(&mut self) -> Option<::upgrade::Pending> {
+        self.state.upgrade.take()
     }
 
     pub fn is_read_closed(&self) -> bool {
@@ -114,7 +119,7 @@ where I: AsyncRead + AsyncWrite,
         read_buf.len() >= 24 && read_buf[..24] == *H2_PREFACE
     }
 
-    pub fn read_head(&mut self) -> Poll<Option<(MessageHead<T::Incoming>, Option<BodyLength>)>, ::Error> {
+    pub fn read_head(&mut self) -> Poll<Option<(MessageHead<T::Incoming>, Option<BodyLength>, ::upgrade::OnUpgrade)>, ::Error> {
         debug_assert!(self.can_read_head());
         trace!("Conn::read_head");
 
@@ -147,15 +152,20 @@ where I: AsyncRead + AsyncWrite,
 
             self.state.version = msg.head.version;
             let head = msg.head;
-            let decoder = match msg.decode {
+            let (decoder, upgrade) = match msg.decode {
                 Decode::Normal(d) => {
-                    d
+                    (d, if msg.wants_auto_upgrade {
+                        self.state.prepare_upgrade()
+                    } else {
+                        ::upgrade::OnUpgrade::none()
+                    })
                 },
-                Decode::Final(d) => {
+                Decode::Upgrade(d) => {
                     trace!("final decoder, HTTP ending");
                     debug_assert!(d.is_eof());
                     self.state.close_read();
-                    d
+                    let upgrade = self.state.prepare_upgrade();
+                    (d, upgrade)
                 },
                 Decode::Ignore => {
                     // likely a 1xx message that we can ignore
@@ -187,7 +197,7 @@ where I: AsyncRead + AsyncWrite,
                 self.try_keep_alive();
             }
 
-            return Ok(Async::Ready(Some((head, content_length))));
+            return Ok(Async::Ready(Some((head, content_length, upgrade))));
         }
     }
 
@@ -649,6 +659,8 @@ struct State {
     reading: Reading,
     /// State of allowed writes
     writing: Writing,
+    /// An expected pending HTTP upgrade.
+    upgrade: Option<::upgrade::Pending>,
     /// Either HTTP/1.0 or 1.1 connection
     version: Version,
 }
@@ -820,6 +832,14 @@ impl State {
             Writing::Closed => true,
             _ => false
         }
+    }
+
+    fn prepare_upgrade(&mut self) -> ::upgrade::OnUpgrade {
+        trace!("prepare possible HTTP upgrade");
+        debug_assert!(self.upgrade.is_none());
+        let (tx, rx) = ::upgrade::pending();
+        self.upgrade = Some(tx);
+        rx
     }
 }
 

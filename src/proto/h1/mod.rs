@@ -19,12 +19,8 @@ mod io;
 mod role;
 
 
-pub(crate) type ServerTransaction = self::role::Server<self::role::YesUpgrades>;
-//pub type ServerTransaction = self::role::Server<self::role::NoUpgrades>;
-//pub type ServerUpgradeTransaction = self::role::Server<self::role::YesUpgrades>;
-
-pub(crate) type ClientTransaction = self::role::Client<self::role::NoUpgrades>;
-pub(crate) type ClientUpgradeTransaction = self::role::Client<self::role::YesUpgrades>;
+pub(crate) type ServerTransaction = role::Server;
+pub(crate) type ClientTransaction = role::Client;
 
 pub(crate) trait Http1Transaction {
     type Incoming;
@@ -40,6 +36,7 @@ pub(crate) trait Http1Transaction {
     fn update_date() {}
 }
 
+/// Result newtype for Http1Transaction::parse.
 pub(crate) type ParseResult<T> = Result<Option<ParsedMessage<T>>, ::error::Parse>;
 
 #[derive(Debug)]
@@ -48,6 +45,7 @@ pub(crate) struct ParsedMessage<T> {
     decode: Decode,
     expect_continue: bool,
     keep_alive: bool,
+    wants_auto_upgrade: bool,
 }
 
 pub(crate) struct ParseContext<'a> {
@@ -69,7 +67,7 @@ pub enum Decode {
     /// Decode normally.
     Normal(Decoder),
     /// After this decoder is done, HTTP is done.
-    Final(Decoder),
+    Upgrade(Decoder),
     /// A header block that should be ignored, like unknown 1xx responses.
     Ignore,
 }

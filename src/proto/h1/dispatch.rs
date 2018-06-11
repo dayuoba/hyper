@@ -5,7 +5,7 @@ use tokio_io::{AsyncRead, AsyncWrite};
 
 use body::{Body, Payload};
 use body::internal::FullDataArg;
-use proto::{BodyLength, Conn, MessageHead, RequestHead, RequestLine, ResponseHead};
+use proto::{BodyLength, Conn, Dispatched, MessageHead, RequestHead, RequestLine, ResponseHead};
 use super::Http1Transaction;
 use service::Service;
 
@@ -65,31 +65,32 @@ where
         (io, buf, self.dispatch)
     }
 
-    /// The "Future" poll function. Runs this dispatcher until the
-    /// connection is shutdown, or an error occurs.
-    pub fn poll_until_shutdown(&mut self) -> Poll<(), ::Error> {
-        self.poll_catch(true)
-    }
-
     /// Run this dispatcher until HTTP says this connection is done,
     /// but don't call `AsyncWrite::shutdown` on the underlying IO.
     ///
-    /// This is useful for HTTP upgrades.
+    /// This is useful for old-style HTTP upgrades, but ignores
+    /// newer-style upgrade API.
     pub fn poll_without_shutdown(&mut self) -> Poll<(), ::Error> {
         self.poll_catch(false)
+            .map(|x| {
+                x.map(|ds| if let Dispatched::Upgrade(pending) = ds {
+                    pending.manual();
+                })
+            })
     }
 
-    fn poll_catch(&mut self, should_shutdown: bool) -> Poll<(), ::Error> {
+    fn poll_catch(&mut self, should_shutdown: bool) -> Poll<Dispatched, ::Error> {
         self.poll_inner(should_shutdown).or_else(|e| {
             // An error means we're shutting down either way.
             // We just try to give the error to the user,
             // and close the connection with an Ok. If we
             // cannot give it to the user, then return the Err.
-            self.dispatch.recv_msg(Err(e)).map(Async::Ready)
+            self.dispatch.recv_msg(Err(e))?;
+            Ok(Async::Ready(Dispatched::Shutdown))
         })
     }
 
-    fn poll_inner(&mut self, should_shutdown: bool) -> Poll<(), ::Error> {
+    fn poll_inner(&mut self, should_shutdown: bool) -> Poll<Dispatched, ::Error> {
         T::update_date();
         loop {
             self.poll_read()?;
@@ -110,11 +111,14 @@ where
         }
 
         if self.is_done() {
-            if should_shutdown {
+            if let Some(pending) = self.conn.pending_upgrade() {
+                self.conn.take_error()?;
+                return Ok(Async::Ready(Dispatched::Upgrade(pending)));
+            } else if should_shutdown {
                 try_ready!(self.conn.shutdown().map_err(::Error::new_shutdown));
             }
             self.conn.take_error()?;
-            Ok(Async::Ready(()))
+            Ok(Async::Ready(Dispatched::Shutdown))
         } else {
             Ok(Async::NotReady)
         }
@@ -190,8 +194,8 @@ where
         }
         // dispatch is ready for a message, try to read one
         match self.conn.read_head() {
-            Ok(Async::Ready(Some((head, body_len)))) => {
-                let body = if let Some(body_len) = body_len {
+            Ok(Async::Ready(Some((head, body_len, on_upgrade)))) => {
+                let mut body = if let Some(body_len) = body_len {
                     let (mut tx, rx) =
                         Body::new_channel(if let BodyLength::Known(len) = body_len {
                             Some(len)
@@ -204,6 +208,7 @@ where
                 } else {
                     Body::empty()
                 };
+                body.set_on_upgrade(on_upgrade);
                 self.dispatch.recv_msg(Ok((head, body)))?;
                 Ok(Async::Ready(()))
             }
@@ -326,7 +331,6 @@ where
     }
 }
 
-
 impl<D, Bs, I, T> Future for Dispatcher<D, Bs, I, T>
 where
     D: Dispatch<PollItem=MessageHead<T::Outgoing>, PollBody=Bs, RecvItem=MessageHead<T::Incoming>>,
@@ -334,12 +338,12 @@ where
     T: Http1Transaction,
     Bs: Payload,
 {
-    type Item = ();
+    type Item = Dispatched;
     type Error = ::Error;
 
     #[inline]
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.poll_until_shutdown()
+        self.poll_catch(true)
     }
 }
 
@@ -519,7 +523,7 @@ mod tests {
 
     use super::*;
     use mock::AsyncIo;
-    use proto::ClientTransaction;
+    use proto::h1::ClientTransaction;
 
     #[test]
     fn client_read_bytes_before_writing_request() {

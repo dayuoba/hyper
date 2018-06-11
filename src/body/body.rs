@@ -10,6 +10,7 @@ use http::HeaderMap;
 use common::Never;
 use super::{Chunk, Payload};
 use super::internal::{FullDataArg, FullDataRet};
+use upgrade::OnUpgrade;
 
 type BodySender = mpsc::Sender<Result<Chunk, ::Error>>;
 
@@ -21,6 +22,7 @@ type BodySender = mpsc::Sender<Result<Chunk, ::Error>>;
 #[must_use = "streams do nothing unless polled"]
 pub struct Body {
     kind: Kind,
+
     /// Allow the client to pass a future to delay the `Body` from returning
     /// EOF. This allows the `Client` to try to put the idle connection
     /// back into the pool before the body is "finished".
@@ -30,6 +32,13 @@ pub struct Body {
     /// a brand new connection, since the pool didn't know about the idle
     /// connection yet.
     delayed_eof: Option<DelayEof>,
+    on_upgrade: OnUpgrade,
+
+    /* TODO
+    /// Keep the extra bits in an `Option<Box<Extra>>`, so that
+    /// Body stays small in the common case (no extras needed).
+    extra: Option<Box<Extra>>,
+    */
 }
 
 enum Kind {
@@ -42,6 +51,21 @@ enum Kind {
     H2(h2::RecvStream),
     Wrapped(Box<Stream<Item=Chunk, Error=Box<::std::error::Error + Send + Sync>> + Send>),
 }
+
+/*
+struct Extra {
+    /// Allow the client to pass a future to delay the `Body` from returning
+    /// EOF. This allows the `Client` to try to put the idle connection
+    /// back into the pool before the body is "finished".
+    ///
+    /// The reason for this is so that creating a new request after finishing
+    /// streaming the body of a response could sometimes result in creating
+    /// a brand new connection, since the pool didn't know about the idle
+    /// connection yet.
+    delayed_eof: Option<DelayEof>,
+    on_upgrade: OnUpgrade,
+}
+*/
 
 type DelayEofUntil = oneshot::Receiver<Never>;
 
@@ -139,15 +163,26 @@ impl Body {
         Body::new(Kind::Wrapped(Box::new(mapped)))
     }
 
+    ///dox
+    pub fn on_upgrade(self) -> OnUpgrade {
+        self.on_upgrade
+    }
+
     fn new(kind: Kind) -> Body {
         Body {
             kind: kind,
             delayed_eof: None,
+            on_upgrade: OnUpgrade::none(),
         }
     }
 
     pub(crate) fn h2(recv: h2::RecvStream) -> Self {
         Body::new(Kind::H2(recv))
+    }
+
+    pub(crate) fn set_on_upgrade(&mut self, upgrade: OnUpgrade) {
+        debug_assert!(self.on_upgrade.is_none());
+        self.on_upgrade = upgrade;
     }
 
     pub(crate) fn delayed_eof(&mut self, fut: DelayEofUntil) {
